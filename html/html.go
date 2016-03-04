@@ -1,4 +1,4 @@
-package main
+package html
 
 import (
 	"bufio"
@@ -12,11 +12,14 @@ import (
 	"strings"
 
 	"github.com/codegangsta/cli"
+	"github.com/lwithers/asn1-tool/util"
 )
 
 func Html(c *cli.Context) error {
 	if len(c.Args()) == 0 {
-		return &UsageError{Problem: "expecting one or more input files"}
+		return &util.UsageError{
+			Problem: "expecting one or more input files",
+		}
 	}
 
 	var (
