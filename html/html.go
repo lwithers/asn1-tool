@@ -3,11 +3,12 @@ package html
 import (
 	"bufio"
 	"bytes"
+	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
-	"html/template"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"strings"
 
@@ -44,7 +45,7 @@ func Html(c *cli.Context) error {
 		out = f
 	}
 
-	err = HtmlAux(out, c.Args())
+	err = HtmlAux(c, out, c.Args())
 	if err != nil {
 		if fname != "" {
 			f.Close()
@@ -67,10 +68,16 @@ func Html(c *cli.Context) error {
 	return nil
 }
 
-func HtmlAux(rawOut io.Writer, fnames []string) error {
+func HtmlAux(c *cli.Context, rawOut io.Writer, fnames []string) error {
 	out := bufio.NewWriter(rawOut)
 
-	err := HtmlHeader(out, fnames)
+	hdrDat := &tppHeaderFooter{
+		Filenames:   fnames,
+		ProgName:    c.App.Name,
+		ProgVersion: c.App.Version,
+	}
+
+	err := HtmlHeader(out, hdrDat)
 	if err != nil {
 		return err
 	}
@@ -82,7 +89,7 @@ func HtmlAux(rawOut io.Writer, fnames []string) error {
 		}
 	}
 
-	err = HtmlFooter(out)
+	err = HtmlFooter(out, hdrDat)
 	if err != nil {
 		return err
 	}
@@ -90,23 +97,12 @@ func HtmlAux(rawOut io.Writer, fnames []string) error {
 	return out.Flush()
 }
 
-func HtmlHeader(out *bufio.Writer, fnames []string) error {
-	t := template.Must(template.New("header").Parse(`<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>asn1-tool | {{.}}</title>
-</head>
-<body>
-`))
-	return t.Execute(out, fnames)
+func HtmlHeader(out *bufio.Writer, hdrDat *tppHeaderFooter) error {
+	return tplHeader.Execute(out, hdrDat)
 }
 
-func HtmlFooter(out *bufio.Writer) error {
-	_, err := out.WriteString(`</body>
-</html>
-`)
-	return err
+func HtmlFooter(out *bufio.Writer, hdrDat *tppHeaderFooter) error {
+	return tplFooter.Execute(out, hdrDat)
 }
 
 func HtmlFile(out *bufio.Writer, fname string) error {
@@ -116,14 +112,7 @@ func HtmlFile(out *bufio.Writer, fname string) error {
 	}
 	isPem := bytes.HasPrefix(raw, []byte("-----BEGIN "))
 
-	t := template.Must(template.New("file").Parse(`<h1>{{.Fname}}</h1>
-<p>{{.Size}} byte {{if .IsPem}}PEM{{else}}DER{{end}} file</p>
-`))
-	err = t.Execute(out, struct {
-		Fname string
-		Size  int
-		IsPem bool
-	}{
+	err = tplFileHeading.Execute(out, tppFileHeading{
 		Fname: fname,
 		Size:  len(raw),
 		IsPem: isPem,
@@ -147,18 +136,7 @@ func HtmlPEMFile(out *bufio.Writer, raw []byte) error {
 		}
 		raw = rest
 
-		t := template.Must(template.New("pem").Parse(`<div class="pem">
-<p>PEM, type: <code>{{.Type}}</code></p>
-{{if .Headers}}<table>
-<thead>
-<tr><th>Header</th><th>Value</th></tr>
-</thead>
-<tbody>
-{{range $hdr, $val := .Headers}}<tr><td>{{$hdr}}</td><td>{{$val}}</td></tr>
-{{end}}</tbody>
-</table>
-{{end}}`))
-		t.Execute(out, block)
+		tplPemBlock.Execute(out, block)
 		err := HtmlDERFile(out, block.Bytes)
 		if err != nil {
 			return err
@@ -181,14 +159,209 @@ func HtmlPEMFile(out *bufio.Writer, raw []byte) error {
 }
 
 func HtmlDERFile(out *bufio.Writer, raw []byte) error {
-	fmt.Fprintf(out, `<div class="der">
+	var err error
+
+	_, err = fmt.Fprintf(out, `<div class="der">
 <p>DER: %d bytes</p>
-</div>
 `, len(raw))
+	if err != nil {
+		return err
+	}
+
+	err = HtmlASN1(out, raw)
+	if err != nil {
+		return err
+	}
+
+	_, err = out.WriteString("</div>\n")
+	return err
+}
+
+func HtmlASN1(out *bufio.Writer, raw []byte) error {
+	var err, parseErr error
+
+	for len(raw) > 0 {
+		var rv asn1.RawValue
+		raw, parseErr = asn1.Unmarshal(raw, &rv)
+		if parseErr != nil {
+			badHdr := tppAsn1BadHeading{
+				Error:  parseErr.Error(),
+				Length: len(raw),
+			}
+			err = tplAsn1BadHeading.Execute(out, &badHdr)
+			if err != nil {
+				return err
+			}
+			err = HtmlHexdump(out, raw)
+			if err != nil {
+				return err
+			}
+			_, err = out.WriteString("</div>\n")
+			return err
+		}
+
+		rvHdr := tppAsn1Heading{
+			Class:      className[rv.Class],
+			IsCompound: rv.IsCompound,
+			Tag:        rv.Tag,
+			HdrSize:    len(rv.FullBytes) - len(rv.Bytes),
+			BodySize:   len(rv.Bytes),
+		}
+		err = tplAsn1Heading.Execute(out, rvHdr)
+		if err != nil {
+			return err
+		}
+
+		/*
+			err = HtmlHexdump(out, rv.FullBytes[:rvHdr.HdrSize])
+			if err != nil {
+				return err
+			}
+		*/
+
+		if rv.IsCompound {
+			err = HtmlASN1(out, rv.Bytes)
+		} else {
+			err = HtmlASN1Scalar(out, &rv)
+		}
+		if err != nil {
+			return err
+		}
+
+		_, err = out.WriteString("</div>")
+		if err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
-func HtmlHexdump(out *bufio.Writer, raw []byte) error {
-	_, err := fmt.Fprintf(out, "<p>Hexdump, %d bytes:</p>\n", len(raw))
+func HtmlASN1Scalar(out *bufio.Writer, rv *asn1.RawValue) error {
+	switch rv.Tag {
+	case asn1.TagBoolean:
+		var b bool
+		asn1.Unmarshal(rv.FullBytes, &b)
+		fmt.Fprintf(out, "<div>BOOLEAN %v</div>", b)
+
+	case asn1.TagInteger:
+		var q *big.Int
+		asn1.Unmarshal(rv.FullBytes, &q)
+		fmt.Fprintf(out, "<div>INTEGER %d</div>", q)
+
+	case asn1.TagBitString:
+		var b asn1.BitString
+		asn1.Unmarshal(rv.FullBytes, &b)
+		HtmlHexdump(out, b.RightAlign())
+
+	case asn1.TagOctetString:
+		var b []byte
+		asn1.Unmarshal(rv.FullBytes, &b)
+		HtmlHexdump(out, b)
+
+	case asn1.TagOID:
+		var oid asn1.ObjectIdentifier
+		asn1.Unmarshal(rv.FullBytes, &oid)
+		fmt.Fprintf(out, "<div>OID %v</div>", oid)
+
+	case asn1.TagUTF8String, asn1.TagPrintableString, asn1.TagT61String,
+		asn1.TagIA5String, asn1.TagGeneralString:
+		var s string
+		asn1.Unmarshal(rv.FullBytes, &s)
+		fmt.Fprintf(out, "<div>STRING %q</div>", s)
+	}
+	return nil
+}
+
+func HtmlBadAsn1(out *bufio.Writer, raw []byte, errToShow error) error {
+	badHdr := tppAsn1BadHeading{
+		Error:  errToShow.Error(),
+		Length: len(raw),
+	}
+	err := tplAsn1BadHeading.Execute(out, &badHdr)
+	if err != nil {
+		return err
+	}
+	err = HtmlHexdump(out, raw)
+	if err != nil {
+		return err
+	}
+	_, err = out.WriteString("</div>\n")
 	return err
+}
+
+var className = [4]string{
+	"universal",
+	"application",
+	"context specific",
+	"private",
+}
+
+func HtmlHexdump(out *bufio.Writer, raw []byte) error {
+	var (
+		pos int
+		err error
+	)
+	_, err = out.WriteString("<pre class='hexdump pre-scrollable'>")
+	for ; pos < len(raw)-15; pos += 16 {
+		err = HtmlHexdumpLine(out, raw[pos:pos+16])
+		if err != nil {
+			return err
+		}
+	}
+	if pos < len(raw) {
+		err = HtmlHexdumpLine(out, raw[pos:])
+		if err != nil {
+			return err
+		}
+	}
+	_, err = fmt.Fprintln(out, "</pre>\n")
+	return err
+}
+
+func HtmlHexdumpLine(out *bufio.Writer, ln []byte) error {
+	var err error
+
+	for i := 0; i < 16; i++ {
+		if i == 8 {
+			err = out.WriteByte(' ')
+		}
+		if i < len(ln) {
+			_, err = fmt.Fprintf(out, "%02X ", ln[i])
+		} else {
+			_, err = out.WriteString("   ")
+		}
+		if err != nil {
+			return err
+		}
+	}
+
+	_, err = out.WriteString("   ")
+	if err != nil {
+		return err
+	}
+
+	for i := 0; i < len(ln); i++ {
+		switch ln[i] {
+		case 0:
+			_, err = fmt.Fprint(out, "<span class='hexdumpZero'>⌁</span>")
+		case '\n':
+			_, err = fmt.Fprint(out, "<span class='hexdumpNewline'>↲</span>")
+		case 0xFF:
+			_, err = fmt.Fprint(out, "<span class='hexdumpFF'>^</span>")
+		case '<':
+			_, err = fmt.Fprint(out, "<span class='hexdumpPrintable>&lt;</span>")
+		case '&':
+			_, err = fmt.Fprint(out, "<span class='hexdumpPrintable>&amp;</span>")
+		default:
+			if ln[i] >= ' ' && ln[i] <= '~' {
+				_, err = fmt.Fprintf(out, "<span class='hexdumpPrintable'>%c</span>", ln[i])
+			} else {
+				_, err = fmt.Fprint(out, "<span class='hexdumpUnprintable'>.</span>")
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return out.WriteByte('\n')
 }
